@@ -8,6 +8,13 @@ pub enum DataKey {
     OptionCounter,
     Option(u32),
     StorageVersion,
+    /// Collateral already paid out by partial exercises of an option. Kept apart
+    /// from `OptionData` so existing stored records keep decoding unchanged.
+    ExercisedAmount(u32),
+    /// Withdrawable collateral an owner holds in the contract, per (owner, asset).
+    FreeCollateral(Address, Address),
+    /// Collateral locked behind open option positions, per (owner, asset).
+    ReservedCollateral(Address, Address),
 }
 
 /// The current options storage layout version. Version zero is the legacy
@@ -107,5 +114,47 @@ pub fn read_option(e: &Env, id: u32) -> OptionData {
 pub fn write_option(e: &Env, id: u32, option: &OptionData) {
     let key = DataKey::Option(id);
     e.storage().persistent().set(&key, option);
+    extend_persistent_ttl_default(e, &key);
+}
+
+pub fn read_free_collateral(e: &Env, owner: &Address, asset: &Address) -> i128 {
+    let key = DataKey::FreeCollateral(owner.clone(), asset.clone());
+    if e.storage().persistent().has(&key) {
+        extend_persistent_ttl_default(e, &key);
+    }
+    e.storage().persistent().get(&key).unwrap_or(0)
+}
+
+pub fn write_free_collateral(e: &Env, owner: &Address, asset: &Address, amount: i128) {
+    let key = DataKey::FreeCollateral(owner.clone(), asset.clone());
+    e.storage().persistent().set(&key, &amount);
+    extend_persistent_ttl_default(e, &key);
+}
+
+pub fn read_reserved_collateral(e: &Env, owner: &Address, asset: &Address) -> i128 {
+    let key = DataKey::ReservedCollateral(owner.clone(), asset.clone());
+    if e.storage().persistent().has(&key) {
+        extend_persistent_ttl_default(e, &key);
+    }
+    e.storage().persistent().get(&key).unwrap_or(0)
+}
+
+pub fn write_reserved_collateral(e: &Env, owner: &Address, asset: &Address, amount: i128) {
+    let key = DataKey::ReservedCollateral(owner.clone(), asset.clone());
+    e.storage().persistent().set(&key, &amount);
+    extend_persistent_ttl_default(e, &key);
+}
+
+pub fn read_exercised_amount(e: &Env, id: u32) -> i128 {
+    let key = DataKey::ExercisedAmount(id);
+    if e.storage().persistent().has(&key) {
+        extend_persistent_ttl_default(e, &key);
+    }
+    e.storage().persistent().get(&key).unwrap_or(0)
+}
+
+pub fn write_exercised_amount(e: &Env, id: u32, amount: i128) {
+    let key = DataKey::ExercisedAmount(id);
+    e.storage().persistent().set(&key, &amount);
     extend_persistent_ttl_default(e, &key);
 }
