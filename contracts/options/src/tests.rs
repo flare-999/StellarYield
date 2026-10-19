@@ -324,6 +324,7 @@ fn test_storage_migration_preserves_open_and_exercised_positions() {
         &underlying,
         &quote,
         &100_000_000_i128,
+        &500u64,
         &1000u64,
         &5_000_000_i128,
     );
@@ -333,6 +334,7 @@ fn test_storage_migration_preserves_open_and_exercised_positions() {
         &underlying,
         &quote,
         &100_000_000_i128,
+        &500u64,
         &1000u64,
         &5_000_000_i128,
     );
@@ -377,7 +379,6 @@ fn test_storage_migration_preserves_open_and_exercised_positions() {
 }
 
 #[test]
-fn test_storage_ttl_extension() {
 fn test_expire_exercised_option_rejected() {
     let (env, client, _, _, underlying, quote) = setup_env();
     let (option_id, _) = mint_call_option(&env, &client, &underlying, &quote);
@@ -437,4 +438,331 @@ fn test_storage_ttl_extension() {
     // Exercise within valid window — verifies TTL extension calls run successfully
     env.ledger().set_timestamp(750);
     client.exercise(&exerciser, &option_id);
+}
+
+// ── Collateral reserve: free vs reserved ──────────────────────────────────
+
+fn mint_with(
+    client: &OptionsContractClient,
+    minter: &Address,
+    underlying: &Address,
+    quote: &Address,
+    collateral: i128,
+) -> u32 {
+    client.mint(
+        minter,
+        &OptionType::Call,
+        underlying,
+        quote,
+        &100_000_000_i128,
+        &500u64,
+        &1000u64,
+        &collateral,
+    )
+}
+
+#[test]
+fn test_deposit_and_withdraw_free_collateral() {
+    let (env, client, _, _, underlying, _) = setup_env();
+    let owner = Address::generate(&env);
+    mint_tokens(&env, &underlying, &owner, 10_000_000);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    client.deposit(&owner, &underlying, &10_000_000);
+    assert_eq!(client.get_free_collateral(&owner, &underlying), 10_000_000);
+    assert_eq!(client.get_reserved_collateral(&owner, &underlying), 0);
+    assert_eq!(token.balance(&owner), 0);
+
+    client.withdraw(&owner, &underlying, &4_000_000);
+    assert_eq!(client.get_free_collateral(&owner, &underlying), 6_000_000);
+    assert_eq!(token.balance(&owner), 4_000_000);
+}
+
+#[test]
+fn test_deposit_and_withdraw_reject_zero_and_overdraw() {
+    let (env, client, _, _, underlying, _) = setup_env();
+    let owner = Address::generate(&env);
+    mint_tokens(&env, &underlying, &owner, 1_000);
+
+    assert_eq!(
+        client.try_deposit(&owner, &underlying, &0),
+        Err(Ok(crate::OptionsError::ZeroAmount))
+    );
+    assert_eq!(
+        client.try_withdraw(&owner, &underlying, &0),
+        Err(Ok(crate::OptionsError::ZeroAmount))
+    );
+    client.deposit(&owner, &underlying, &1_000);
+    assert_eq!(
+        client.try_withdraw(&owner, &underlying, &1_001),
+        Err(Ok(crate::OptionsError::InsufficientFreeCollateral))
+    );
+}
+
+#[test]
+fn test_mint_without_deposit_reserves_collateral_from_wallet() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (_, minter) = mint_call_option(&env, &client, &underlying, &quote);
+
+    assert_eq!(client.get_free_collateral(&minter, &underlying), 0);
+    assert_eq!(
+        client.get_reserved_collateral(&minter, &underlying),
+        10_000_000
+    );
+    // Reserved collateral cannot be withdrawn.
+    assert_eq!(
+        client.try_withdraw(&minter, &underlying, &1),
+        Err(Ok(crate::OptionsError::InsufficientFreeCollateral))
+    );
+}
+
+#[test]
+fn test_mint_uses_free_collateral_then_wallet_for_shortfall() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let minter = Address::generate(&env);
+    mint_tokens(&env, &underlying, &minter, 10_000_000);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    client.deposit(&minter, &underlying, &4_000_000);
+    mint_with(&client, &minter, &underlying, &quote, 10_000_000);
+
+    // 4M came from free collateral, 6M was pulled from the wallet.
+    assert_eq!(client.get_free_collateral(&minter, &underlying), 0);
+    assert_eq!(
+        client.get_reserved_collateral(&minter, &underlying),
+        10_000_000
+    );
+    assert_eq!(token.balance(&minter), 0);
+    assert_eq!(token.balance(&client.address), 10_000_000);
+}
+
+#[test]
+fn test_withdraw_cannot_touch_collateral_reserved_by_open_option() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let minter = Address::generate(&env);
+    mint_tokens(&env, &underlying, &minter, 15_000_000);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    client.deposit(&minter, &underlying, &15_000_000);
+    mint_with(&client, &minter, &underlying, &quote, 10_000_000);
+    assert_eq!(client.get_free_collateral(&minter, &underlying), 5_000_000);
+
+    // Withdrawing more than the free 5M would undercollateralize the option.
+    assert_eq!(
+        client.try_withdraw(&minter, &underlying, &5_000_001),
+        Err(Ok(crate::OptionsError::InsufficientFreeCollateral))
+    );
+    client.withdraw(&minter, &underlying, &5_000_000);
+
+    assert_eq!(client.get_free_collateral(&minter, &underlying), 0);
+    assert_eq!(
+        client.get_reserved_collateral(&minter, &underlying),
+        10_000_000
+    );
+    // The contract still holds every unit of reserved collateral.
+    assert_eq!(token.balance(&client.address), 10_000_000);
+}
+
+#[test]
+fn test_overlapping_positions_accumulate_reserve() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let minter = Address::generate(&env);
+    mint_tokens(&env, &underlying, &minter, 30_000_000);
+    let token = soroban_sdk::token::Client::new(&env, &underlying);
+
+    client.deposit(&minter, &underlying, &18_000_000);
+    mint_with(&client, &minter, &underlying, &quote, 10_000_000);
+    mint_with(&client, &minter, &underlying, &quote, 5_000_000);
+
+    assert_eq!(
+        client.get_reserved_collateral(&minter, &underlying),
+        15_000_000
+    );
+    assert_eq!(client.get_free_collateral(&minter, &underlying), 3_000_000);
+
+    // Only the 3M that backs no open position can leave.
+    assert_eq!(
+        client.try_withdraw(&minter, &underlying, &4_000_000),
+        Err(Ok(crate::OptionsError::InsufficientFreeCollateral))
+    );
+    client.withdraw(&minter, &underlying, &3_000_000);
+
+    // Expiring one position releases only its own share of the reserve.
+    env.ledger().set_timestamp(1001);
+    client.expire(&1);
+    assert_eq!(
+        client.get_reserved_collateral(&minter, &underlying),
+        5_000_000
+    );
+    assert_eq!(token.balance(&client.address), 5_000_000);
+}
+
+#[test]
+fn test_partial_exercise_releases_only_the_exercised_reserve() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let exerciser = Address::generate(&env);
+    mint_tokens(&env, &quote, &exerciser, 200_000_000);
+    let token_u = soroban_sdk::token::Client::new(&env, &underlying);
+    let token_q = soroban_sdk::token::Client::new(&env, &quote);
+
+    env.ledger().set_timestamp(750);
+    client.exercise_partial(&exerciser, &option_id, &4_000_000);
+
+    // 4M of the 10M left the contract; the other 6M stays reserved.
+    assert_eq!(token_u.balance(&exerciser), 4_000_000);
+    assert_eq!(token_q.balance(&minter), 40_000_000);
+    assert_eq!(
+        client.get_reserved_collateral(&minter, &underlying),
+        6_000_000
+    );
+    assert_eq!(token_u.balance(&client.address), 6_000_000);
+    assert_eq!(
+        client.try_withdraw(&minter, &underlying, &1),
+        Err(Ok(crate::OptionsError::InsufficientFreeCollateral))
+    );
+
+    // The option is still open and can be partially exercised again.
+    client.exercise_partial(&exerciser, &option_id, &1_000_000);
+    assert_eq!(
+        client.get_reserved_collateral(&minter, &underlying),
+        5_000_000
+    );
+}
+
+#[test]
+fn test_partial_exercise_rejects_zero_and_excess_amounts() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, _) = mint_call_option(&env, &client, &underlying, &quote);
+    let exerciser = Address::generate(&env);
+    mint_tokens(&env, &quote, &exerciser, 200_000_000);
+
+    env.ledger().set_timestamp(750);
+    assert_eq!(
+        client.try_exercise_partial(&exerciser, &option_id, &0),
+        Err(Ok(crate::OptionsError::ZeroAmount))
+    );
+    assert_eq!(
+        client.try_exercise_partial(&exerciser, &option_id, &10_000_001),
+        Err(Ok(crate::OptionsError::ExceedsCollateral))
+    );
+
+    // After a partial exercise only the remainder can be exercised.
+    client.exercise_partial(&exerciser, &option_id, &7_000_000);
+    assert_eq!(
+        client.try_exercise_partial(&exerciser, &option_id, &3_000_001),
+        Err(Ok(crate::OptionsError::ExceedsCollateral))
+    );
+}
+
+#[test]
+fn test_partial_exercise_respects_exercise_window() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, _) = mint_call_option(&env, &client, &underlying, &quote);
+    let exerciser = Address::generate(&env);
+    mint_tokens(&env, &quote, &exerciser, 200_000_000);
+
+    env.ledger().set_timestamp(499);
+    assert_eq!(
+        client.try_exercise_partial(&exerciser, &option_id, &1_000_000),
+        Err(Ok(crate::OptionsError::TooEarly))
+    );
+    env.ledger().set_timestamp(1001);
+    assert_eq!(
+        client.try_exercise_partial(&exerciser, &option_id, &1_000_000),
+        Err(Ok(crate::OptionsError::ExerciseWindowClosed))
+    );
+}
+
+#[test]
+fn test_finishing_partial_exercise_closes_position_and_clears_reserve() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let exerciser = Address::generate(&env);
+    mint_tokens(&env, &quote, &exerciser, 200_000_000);
+
+    env.ledger().set_timestamp(750);
+    client.exercise_partial(&exerciser, &option_id, &4_000_000);
+    // A full exercise now settles just the remaining 6M.
+    client.exercise(&exerciser, &option_id);
+
+    assert_eq!(client.get_reserved_collateral(&minter, &underlying), 0);
+    let token_u = soroban_sdk::token::Client::new(&env, &underlying);
+    assert_eq!(token_u.balance(&exerciser), 10_000_000);
+    assert_eq!(token_u.balance(&client.address), 0);
+
+    assert_eq!(
+        client.try_exercise(&exerciser, &option_id),
+        Err(Ok(crate::OptionsError::AlreadyExercised))
+    );
+    // The stored record keeps the original collateral amount.
+    let option = env.as_contract(&client.address, || {
+        crate::storage::read_option(&env, option_id)
+    });
+    assert!(option.exercised);
+    assert_eq!(option.collateral_amount, 10_000_000);
+}
+
+#[test]
+fn test_expire_after_partial_exercise_returns_only_remaining_collateral() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (option_id, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let exerciser = Address::generate(&env);
+    mint_tokens(&env, &quote, &exerciser, 200_000_000);
+    let token_u = soroban_sdk::token::Client::new(&env, &underlying);
+
+    env.ledger().set_timestamp(750);
+    client.exercise_partial(&exerciser, &option_id, &4_000_000);
+
+    env.ledger().set_timestamp(1001);
+    client.expire(&option_id);
+
+    // Minter started with 20M, locked 10M, and gets back the unexercised 6M.
+    assert_eq!(token_u.balance(&minter), 16_000_000);
+    assert_eq!(token_u.balance(&client.address), 0);
+    assert_eq!(client.get_reserved_collateral(&minter, &underlying), 0);
+}
+
+#[test]
+fn test_put_option_reserves_quote_asset_collateral() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let minter = Address::generate(&env);
+    mint_tokens(&env, &quote, &minter, 10_000_000);
+
+    client.mint(
+        &minter,
+        &OptionType::Put,
+        &underlying,
+        &quote,
+        &100_000_000_i128,
+        &500u64,
+        &1000u64,
+        &10_000_000_i128,
+    );
+
+    assert_eq!(client.get_reserved_collateral(&minter, &quote), 10_000_000);
+    assert_eq!(client.get_reserved_collateral(&minter, &underlying), 0);
+    assert_eq!(
+        client.try_withdraw(&minter, &quote, &1),
+        Err(Ok(crate::OptionsError::InsufficientFreeCollateral))
+    );
+}
+
+#[test]
+fn test_reserve_is_tracked_per_owner() {
+    let (env, client, _, _, underlying, quote) = setup_env();
+    let (_, minter) = mint_call_option(&env, &client, &underlying, &quote);
+    let other = Address::generate(&env);
+    mint_tokens(&env, &underlying, &other, 3_000_000);
+    client.deposit(&other, &underlying, &3_000_000);
+
+    // Another owner's deposit is unaffected by the minter's reserve, and the
+    // minter cannot withdraw it.
+    assert_eq!(client.get_free_collateral(&other, &underlying), 3_000_000);
+    assert_eq!(client.get_free_collateral(&minter, &underlying), 0);
+    assert_eq!(
+        client.try_withdraw(&minter, &underlying, &1),
+        Err(Ok(crate::OptionsError::InsufficientFreeCollateral))
+    );
+    client.withdraw(&other, &underlying, &3_000_000);
 }
