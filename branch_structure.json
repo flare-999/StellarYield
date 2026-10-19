@@ -1,0 +1,21 @@
+{
+  "default_branch": "dev",
+  "branches": [
+    "dev",
+    "fix/issue-1463-add-option-assignment-behavior-when-writers",
+    "fix/issue-1468-add-a-query-for-option-collateral-health-by",
+    "origin"
+  ],
+  "parent": {
+    "dev": null,
+    "fix/issue-1463-add-option-assignment-behavior-when-writers": "dev",
+    "fix/issue-1468-add-a-query-for-option-collateral-health-by": "dev",
+    "origin": "dev"
+  },
+  "order": [
+    "dev",
+    "fix/issue-1463-add-option-assignment-behavior-when-writers",
+    "fix/issue-1468-add-a-query-for-option-collateral-health-by",
+    "origin"
+  ]
+}
